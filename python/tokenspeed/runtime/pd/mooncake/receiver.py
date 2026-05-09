@@ -187,6 +187,7 @@ class MooncakeKVReceiver:
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
 
         (
             target_tp_rank,
@@ -210,6 +211,7 @@ class MooncakeKVReceiver:
                     f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {target_dp_group}",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
             else:
                 assert len(bootstrap_infos) > 0
                 self.bootstrap_infos = bootstrap_infos

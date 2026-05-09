@@ -89,6 +89,7 @@ class MooncakeKVManagerBase:
 
         self.rank_port = None
         self.request_status: Dict[int, KVPoll] = {}
+        self.request_status_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -112,16 +113,16 @@ class MooncakeKVManagerBase:
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            self.request_status[bootstrap_room] = status
-        else:
-            #  status is only allowed to be incremented unless it is KVPoll.Failed
-            if status == KVPoll.Failed:
+        with self.request_status_lock:
+            cur = self.request_status.get(bootstrap_room)
+            if cur is None:
+                self.request_status[bootstrap_room] = status
+            elif cur == KVPoll.Failed:
+                pass
+            elif status == KVPoll.Failed:
                 self.request_status[bootstrap_room] = KVPoll.Failed
             else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
+                self.request_status[bootstrap_room] = max(cur, status)
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
