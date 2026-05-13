@@ -138,11 +138,46 @@ class FlashMLABackend(AttentionBackend):
                 "FlashMLABackend no longer supports "
                 "kv_cache_quant_method='per_token_head'."
             )
-        if self.cache_dtype == torch.float8_e4m3fn:
-            raise NotImplementedError(
-                "FlashMLABackend no longer supports dense FP8 KV cache. "
-                "Use a non-FP8 KV cache."
+
+        # FP8 KV cache support (DSv3 narrow path).
+        #
+        # When ``kv_cache_dtype == torch.float8_e4m3fn`` we route through the
+        # same upstream entry-points used for BF16 (``flash_mla_with_kvcache``
+        # and ``get_mla_metadata``) but pass ``is_fp8_kvcache=True`` plus
+        # ``descale_q`` / ``descale_k`` -- mirroring the contract already used
+        # by ``backends/deepseek_v4.py``. The flag is fixed at ``__init__`` so
+        # the backend must be recreated on a ``kv_cache_dtype`` change; the
+        # cudagraph capture state is keyed off the FP8 metadata layout chosen
+        # here and would be invalidated by an in-place dtype flip.
+        self.is_fp8_kv_cache = self.cache_dtype == torch.float8_e4m3fn
+
+        # Pre-allocate the 1-element fp32 ``descale_q`` / ``descale_k``
+        # tensors once so the per-step forward never allocates a fresh CUDA
+        # tensor from a Python scalar. Pinned to ``1.0`` because the current
+        # KV cache writer at ``runtime/layers/attention/kv_cache/mla.py`` does
+        # not divide by ``k_scale`` on write, and ``_maybe_quantize_q_fp8``
+        # below casts q with an implicit ``q_scale = 1.0`` (documented as a
+        # precision tradeoff in the docstring).
+        if self.is_fp8_kv_cache:
+            self._descale_q_buf = torch.ones(
+                1, dtype=torch.float32, device=config.device
             )
+            self._descale_k_buf = torch.ones(
+                1, dtype=torch.float32, device=config.device
+            )
+        else:
+            self._descale_q_buf = None
+            self._descale_k_buf = None
+
+        # Cached SM count for ``_assert_metadata_fits`` (vLLM stores the same
+        # value at ``vllm/v1/attention/backends/mla/flashmla.py:160``). The
+        # upstream FP8 metadata builder returns a tile-scheduler tensor whose
+        # leading dim is ``<= num_sms``; we assert that invariant at every
+        # metadata-builder site so a shape regression fails loudly rather
+        # than corrupting cudagraph replay.
+        self._num_sms = torch.cuda.get_device_properties(
+            config.device
+        ).multi_processor_count
 
         # Workspace buffer + flashinfer prefill wrappers (EXTEND path only).
         global _global_workspace_buffer
@@ -177,6 +212,77 @@ class FlashMLABackend(AttentionBackend):
         self.last_seq_lens_sum: int | None = None
 
     # ------------------------------------------------------------------
+    # FP8 helpers (no-ops on BF16/FP16)
+    # ------------------------------------------------------------------
+
+    def _fp8_metadata_kwargs(self) -> dict:
+        """Extra kwargs to spread into ``get_mla_metadata`` for FP8 KV.
+
+        Returns ``{"is_fp8_kvcache": True}`` when the backend was constructed
+        with an FP8 cache, else an empty dict so the BF16 call site is
+        byte-identical to the original.
+        """
+        if self.is_fp8_kv_cache:
+            return {"is_fp8_kvcache": True}
+        return {}
+
+    def _assert_metadata_fits(self, tile_scheduler_metadata: torch.Tensor) -> None:
+        """Guard against the FP8 metadata leading dim exceeding ``num_sms``.
+
+        The upstream FP8 metadata builder returns a tile-scheduler tensor of
+        shape ``(K, 8)`` with ``K <= num_sms``. The cudagraph replay path
+        copies into a pre-allocated buffer; if ``K`` ever exceeds the SM
+        count the copy would raise a shape-mismatch error or silently corrupt
+        memory. We fail loudly here instead. No-op on BF16/FP16 (the BF16
+        builder's leading dim is bounded by ``batch_size``, which is already
+        well under ``num_sms`` for any reasonable serving config).
+        """
+        if not self.is_fp8_kv_cache:
+            return
+        leading = tile_scheduler_metadata.shape[0]
+        if leading > self._num_sms:
+            raise RuntimeError(
+                "FlashMLA FP8 tile_scheduler_metadata leading dim "
+                f"{leading} exceeds num_sms={self._num_sms}. "
+                "This is a cudagraph-replay hazard; pin a worst-case "
+                "(num_sms, 8) buffer (see vLLM's "
+                "v1/attention/backends/mla/flashmla.py:178-194)."
+            )
+
+    def _maybe_quantize_q_fp8(
+        self, q: torch.Tensor, layer: PagedAttention
+    ) -> torch.Tensor:
+        """Cast ``q`` to ``float8_e4m3fn`` for the FP8 kernel path.
+
+        The upstream FP8 dispatch in ``flash_mla_with_kvcache`` is gated on
+        ``q.element_size() == 1``, so q must be FP8 when ``is_fp8_kvcache=True``.
+        The cast uses an implicit ``q_scale = 1.0`` and the cached
+        ``_descale_q_buf`` stays pinned at ``1.0`` -- a known precision
+        tradeoff for the DSv3 narrow scope; dynamic ``q_scale`` is a tracked
+        follow-up.
+
+        Hard-asserts ``layer.k_scale_float == 1.0`` because the KV cache
+        writer at ``runtime/layers/attention/kv_cache/mla.py`` does NOT yet
+        divide by ``k_scale`` on write. A non-1.0 ``k_scale_float`` would
+        silently corrupt reads (the writer didn't scale; the reader would
+        divide by k_scale).
+        """
+        if not self.is_fp8_kv_cache:
+            return q
+        k_scale = getattr(layer, "k_scale_float", 1.0)
+        if k_scale != 1.0:
+            raise NotImplementedError(
+                "FlashMLABackend FP8 path requires layer.k_scale_float == 1.0. "
+                f"Got {k_scale}. The KV cache writer at "
+                "runtime/layers/attention/kv_cache/mla.py (the non-"
+                "'per_token_head' branch) does not yet divide by k_scale on "
+                "write, so a non-1.0 k_scale_float would double-correct and "
+                "corrupt outputs. Either set k_scale=1.0 or teach the writer "
+                "to scale K at write time."
+            )
+        return q.to(torch.float8_e4m3fn)
+
+    # ------------------------------------------------------------------
     # Metadata init
     # ------------------------------------------------------------------
 
@@ -203,7 +309,9 @@ class FlashMLABackend(AttentionBackend):
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
+                **self._fp8_metadata_kwargs(),
             )
+            self._assert_metadata_fits(mla_metadata)
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
                 num_splits,
@@ -215,7 +323,9 @@ class FlashMLABackend(AttentionBackend):
                 seq_lens.to(torch.int32),
                 self.draft_token_num * self.num_q_heads,
                 1,
+                **self._fp8_metadata_kwargs(),
             )
+            self._assert_metadata_fits(mla_metadata)
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
                 num_splits,
@@ -312,6 +422,7 @@ class FlashMLABackend(AttentionBackend):
                 ),
                 self.draft_token_num * self.num_q_heads,
                 1,
+                **self._fp8_metadata_kwargs(),
             )
         else:
             (
@@ -323,7 +434,9 @@ class FlashMLABackend(AttentionBackend):
                 ),
                 self.num_q_heads,
                 1,
+                **self._fp8_metadata_kwargs(),
             )
+        self._assert_metadata_fits(self.cuda_graph_mla_metadata)
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
     def init_forward_metadata_capture_cuda_graph(
@@ -340,7 +453,9 @@ class FlashMLABackend(AttentionBackend):
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
+                **self._fp8_metadata_kwargs(),
             )
+            self._assert_metadata_fits(mla_metadata)
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.cuda_graph_kv_indices[:bs].copy_(block_table)
@@ -355,7 +470,9 @@ class FlashMLABackend(AttentionBackend):
                 seq_lens.to(torch.int32),
                 self.draft_token_num * self.num_q_heads,
                 1,
+                **self._fp8_metadata_kwargs(),
             )
+            self._assert_metadata_fits(mla_metadata)
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.cuda_graph_kv_indices[:bs].copy_(block_table)
@@ -388,7 +505,9 @@ class FlashMLABackend(AttentionBackend):
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
+                **self._fp8_metadata_kwargs(),
             )
+            self._assert_metadata_fits(mla_metadata)
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.cuda_graph_kv_indices[:bs].copy_(block_table)
@@ -403,7 +522,9 @@ class FlashMLABackend(AttentionBackend):
                 seq_lens.to(torch.int32),
                 self.draft_token_num * self.num_q_heads,
                 1,
+                **self._fp8_metadata_kwargs(),
             )
+            self._assert_metadata_fits(mla_metadata)
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.cuda_graph_kv_indices[:bs].copy_(block_table)
@@ -465,9 +586,22 @@ class FlashMLABackend(AttentionBackend):
             layer.tp_q_head_num == self.num_q_heads
         ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
         reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
+        # FP8 path: cast q to fp8 (kernel dispatches on q.element_size() == 1).
+        # On BF16 ``kernel_q is reshape_q`` because ``_maybe_quantize_q_fp8``
+        # early-returns, so the call shape is byte-identical to the original.
+        kernel_q = self._maybe_quantize_q_fp8(reshape_q, layer)
+        fp8_kwargs = (
+            {
+                "is_fp8_kvcache": True,
+                "descale_q": self._descale_q_buf,
+                "descale_k": self._descale_k_buf,
+            }
+            if self.is_fp8_kv_cache
+            else {}
+        )
 
         o, _ = flash_mla_with_kvcache(
-            q=reshape_q,
+            q=kernel_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
             block_table=self.forward_metadata.block_table[:bs],
             cache_seqlens=seq_lens.to(torch.int32) + self.draft_token_num,
@@ -476,6 +610,7 @@ class FlashMLABackend(AttentionBackend):
             num_splits=self.forward_metadata.num_splits,
             softmax_scale=layer.scaling,
             causal=True,
+            **fp8_kwargs,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -543,9 +678,22 @@ class FlashMLABackend(AttentionBackend):
         ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
         reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
         cache_lens = seq_lens
+        # FP8 path: cast q to fp8 (kernel dispatches on q.element_size() == 1).
+        # On BF16 ``kernel_q is reshape_q`` because ``_maybe_quantize_q_fp8``
+        # early-returns, so the call shape is byte-identical to the original.
+        kernel_q = self._maybe_quantize_q_fp8(reshape_q, layer)
+        fp8_kwargs = (
+            {
+                "is_fp8_kvcache": True,
+                "descale_q": self._descale_q_buf,
+                "descale_k": self._descale_k_buf,
+            }
+            if self.is_fp8_kv_cache
+            else {}
+        )
 
         o, _ = flash_mla_with_kvcache(
-            q=reshape_q,
+            q=kernel_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
             block_table=self.forward_metadata.block_table[:bs],
             cache_seqlens=cache_lens.to(torch.int32),
@@ -554,6 +702,7 @@ class FlashMLABackend(AttentionBackend):
             num_splits=self.forward_metadata.num_splits,
             softmax_scale=layer.scaling,
             causal=True,
+            **fp8_kwargs,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
