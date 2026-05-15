@@ -25,6 +25,8 @@ platform = current_platform()
 
 flash_mla_with_kvcache = error_fn
 get_mla_metadata = error_fn
+flashmla_dense_fp8_fwd = error_fn
+flashmla_dense_fp8_metadata = error_fn
 
 if platform.is_nvidia and platform.is_hopper:
     try:
@@ -35,8 +37,22 @@ if platform.is_nvidia and platform.is_hopper:
     except ImportError:
         pass
 
+    # Dense FP8 MLA decode kernel (sm_90a only).
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.flashmla_dense_fp8 import (
+            flashmla_dense_fp8_fwd,
+            flashmla_dense_fp8_metadata,
+        )
+    except ImportError:
+        pass
+
 # ------------------------------------------------------------------------------
 # Direct export
 # ------------------------------------------------------------------------------
 
-__all__ = ["flash_mla_with_kvcache", "get_mla_metadata"]
+__all__ = [
+    "flash_mla_with_kvcache",
+    "get_mla_metadata",
+    "flashmla_dense_fp8_fwd",
+    "flashmla_dense_fp8_metadata",
+]

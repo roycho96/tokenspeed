@@ -265,11 +265,15 @@ def _ensure_cuda_compiler() -> None:
 
 
 # Kernel groups: each entry produces one .so file.
-# Format: (name, [source_files], extra_ldflags) or
-#         (name, [source_files], extra_ldflags, extra_cflags)
+# Format: (name, [source_files], extra_ldflags),
+#         (name, [source_files], extra_ldflags, extra_cflags), or
+#         (name, [source_files], extra_ldflags, extra_cflags, supported_archs)
 # The 4-tuple form lets a kernel append nvcc flags on top of the global set —
 # e.g. merge_state needs ``-O3 -use_fast_math`` to match flashinfer's bundled
 # build. extra_cflags defaults to [] when omitted.
+# The 5-tuple form pins a kernel to a subset of CUDA architectures (e.g.
+# ("90a",) for sm_90a-only kernels). If the detected build archs do not
+# intersect supported_archs, the group is skipped instead of compiled.
 KERNEL_GROUPS = [
     (
         "rope",
@@ -388,6 +392,19 @@ KERNEL_GROUPS = [
         ],
         [],
     ),
+    (
+        "flashmla_dense_fp8",
+        [
+            CUDA_CSRC_DIR / "flashmla_dense_fp8_binding.cu",
+            CUDA_CSRC_DIR / "flashmla_dense_fp8" / "flash_fwd_mla_fp8_sm90.cu",
+            CUDA_CSRC_DIR / "flashmla_dense_fp8" / "flash_fwd_mla_metadata.cu",
+        ],
+        [],
+        # Dense FP8 MLA kernels need C++20 + lambda extensions.
+        # The trailing -std=c++20 overrides the base -std=c++17 in nvcc_flags.
+        ["-std=c++20", "--expt-extended-lambda", "-use_fast_math"],
+        ("90a",),
+    ),
 ]
 
 
@@ -487,7 +504,7 @@ class CudaKernelBuilder:
         gencode_flags = [
             f"-gencode=arch=compute_{a},code=sm_{a}" for a in sorted(archs)
         ]
-        nvcc_flags = [
+        nvcc_flags_base = [
             "-std=c++17",
             "-O2",
             "--expt-relaxed-constexpr",
@@ -496,7 +513,7 @@ class CudaKernelBuilder:
             "-DFLASHINFER_ENABLE_F16",
             "-DENABLE_BF16",
             "-DENABLE_FP8",
-        ] + gencode_flags
+        ]
         include_dirs = self._resolve_include_dirs()
         ldflags = [
             "-shared",
@@ -514,6 +531,24 @@ class CudaKernelBuilder:
         for entry in self.kernel_groups:
             name, sources, extra_ldflags = entry[0], entry[1], entry[2]
             extra_cflags = entry[3] if len(entry) > 3 else []
+            supported_archs = entry[4] if len(entry) > 4 else None
+            if supported_archs is not None:
+                usable_archs = set(supported_archs) & archs
+                if not usable_archs:
+                    if self.verbose:
+                        print(
+                            f"Skipping {name}: requires arch(s) "
+                            f"{sorted(supported_archs)}, none in detected "
+                            f"{sorted(archs)}"
+                        )
+                    skipped_groups += 1
+                    continue
+                group_gencode = [
+                    f"-gencode=arch=compute_{a},code=sm_{a}"
+                    for a in sorted(usable_archs)
+                ]
+            else:
+                group_gencode = gencode_flags
             out_dir = CUDA_OBJS_DIR / name
             out_dir.mkdir(parents=True, exist_ok=True)
             so_path = out_dir / f"{name}.so"
@@ -522,9 +557,11 @@ class CudaKernelBuilder:
             ):
                 skipped_groups += 1
                 continue
-            stale_groups.append((name, sources, extra_ldflags, extra_cflags, so_path))
+            stale_groups.append(
+                (name, sources, extra_ldflags, extra_cflags, group_gencode, so_path)
+            )
 
-        stale_sources = sum(len(srcs) for _, srcs, _, _, _ in stale_groups)
+        stale_sources = sum(len(srcs) for _, srcs, _, _, _, _ in stale_groups)
         print(
             f"Building {len(stale_groups)}/{len(self.kernel_groups)} kernel group(s) "
             f"({stale_sources}/{total_sources} files, {max_jobs} parallel jobs)..."
@@ -538,7 +575,15 @@ class CudaKernelBuilder:
         with ThreadPoolExecutor(max_workers=max_jobs) as executor:
             group_meta = []
             futures = []
-            for name, sources, extra_ldflags, extra_cflags, so_path in stale_groups:
+            for (
+                name,
+                sources,
+                extra_ldflags,
+                extra_cflags,
+                group_gencode,
+                so_path,
+            ) in stale_groups:
+                group_nvcc_flags = nvcc_flags_base + group_gencode
                 out_dir = so_path.parent
                 objects = []
                 for src in sources:
@@ -549,7 +594,7 @@ class CudaKernelBuilder:
                             self._compile_one,
                             str(src),
                             str(obj),
-                            nvcc_flags,
+                            group_nvcc_flags,
                             include_dirs,
                             extra_cflags,
                         )

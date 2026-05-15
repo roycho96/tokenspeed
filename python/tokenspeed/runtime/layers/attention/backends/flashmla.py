@@ -27,7 +27,11 @@ import torch
 from tokenspeed_kernel.ops.attention.flash_attn import flash_attn_varlen_func
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_with_kvcache,
-    get_mla_metadata,
+    flashmla_dense_fp8_fwd,
+    flashmla_dense_fp8_metadata,
+)
+from tokenspeed_kernel.ops.attention.flash_mla import (
+    get_mla_metadata as _bf16_get_mla_metadata,
 )
 from tokenspeed_kernel.ops.attention.flashinfer import (
     BatchMLAPagedAttentionWrapper,
@@ -138,11 +142,22 @@ class FlashMLABackend(AttentionBackend):
                 "FlashMLABackend no longer supports "
                 "kv_cache_quant_method='per_token_head'."
             )
-        if self.cache_dtype == torch.float8_e4m3fn:
-            raise NotImplementedError(
-                "FlashMLABackend no longer supports dense FP8 KV cache. "
-                "Use a non-FP8 KV cache."
+
+        # Dense FP8 KV cache dispatches to the sm_90a dense FP8 decode kernel.
+        # Q is cast to float8_e4m3fn before each call; KV writer must already
+        # store FP8. Both descale tensors are pinned to 1.0 because the cache
+        # writer does not scale on write.
+        self.is_fp8_kv_cache = self.cache_dtype == torch.float8_e4m3fn
+        if self.is_fp8_kv_cache:
+            self._descale_q_buf = torch.ones(
+                (1,), dtype=torch.float32, device=config.device
             )
+            self._descale_k_buf = torch.ones(
+                (1,), dtype=torch.float32, device=config.device
+            )
+        else:
+            self._descale_q_buf = None
+            self._descale_k_buf = None
 
         # Workspace buffer + flashinfer prefill wrappers (EXTEND path only).
         global _global_workspace_buffer
@@ -177,6 +192,72 @@ class FlashMLABackend(AttentionBackend):
         self.last_seq_lens_sum: int | None = None
 
     # ------------------------------------------------------------------
+    # FP8 / BF16 dispatch helpers
+    # ------------------------------------------------------------------
+
+    def _call_metadata(
+        self,
+        seqlens_i32: torch.Tensor,
+        num_q_heads_eff: int,
+        num_heads_k: int,
+    ):
+        """Build (tile_scheduler_metadata, num_splits) for FlashMLA decode.
+
+        Dispatches to the sm_90a dense FP8 metadata builder when the KV
+        cache is float8_e4m3fn; otherwise uses the BF16/FP16 path.
+        Signature matches ``get_mla_metadata`` for drop-in replacement.
+        """
+        if self.is_fp8_kv_cache:
+            return flashmla_dense_fp8_metadata(
+                seqlens_i32, num_q_heads_eff, num_heads_k
+            )
+        return _bf16_get_mla_metadata(seqlens_i32, num_q_heads_eff, num_heads_k)
+
+    def _call_kvcache_fwd(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        tile_scheduler_metadata,
+        num_splits: torch.Tensor,
+        softmax_scale: float,
+        causal: bool,
+    ) -> torch.Tensor:
+        """Dispatch to BF16 or dense FP8 KV cache decode forward.
+
+        Returns the out tensor with shape (bs, seqlen_q, num_q_heads,
+        kv_lora_rank). FP8 path casts q to float8_e4m3fn and passes
+        identity descale buffers (cache writer does not scale on write).
+        """
+        if self.is_fp8_kv_cache:
+            out, _ = flashmla_dense_fp8_fwd(
+                q.to(torch.float8_e4m3fn),
+                k_cache,
+                block_table,
+                cache_seqlens,
+                tile_scheduler_metadata,
+                num_splits,
+                self._descale_q_buf,
+                self._descale_k_buf,
+                float(softmax_scale),
+                bool(causal),
+            )
+            return out
+        o, _ = flash_mla_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=self.kv_lora_rank,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            softmax_scale=softmax_scale,
+            causal=causal,
+        )
+        return o
+
+    # ------------------------------------------------------------------
     # Metadata init
     # ------------------------------------------------------------------
 
@@ -199,7 +280,7 @@ class FlashMLABackend(AttentionBackend):
             block_table = None
 
         if forward_mode.is_decode_or_idle():
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
@@ -211,7 +292,7 @@ class FlashMLABackend(AttentionBackend):
             )
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
             seq_lens = seq_lens + self.draft_token_num
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_metadata(
                 seq_lens.to(torch.int32),
                 self.draft_token_num * self.num_q_heads,
                 1,
@@ -306,7 +387,7 @@ class FlashMLABackend(AttentionBackend):
             (
                 self.cuda_graph_mla_metadata,
                 self.cuda_graph_num_splits,
-            ) = get_mla_metadata(
+            ) = self._call_metadata(
                 torch.ones(
                     max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
                 ),
@@ -317,7 +398,7 @@ class FlashMLABackend(AttentionBackend):
             (
                 self.cuda_graph_mla_metadata,
                 self.cuda_graph_num_splits,
-            ) = get_mla_metadata(
+            ) = self._call_metadata(
                 torch.ones(
                     max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
                 ),
@@ -336,7 +417,7 @@ class FlashMLABackend(AttentionBackend):
     ):
         block_table = self.cuda_graph_kv_indices[:bs]
         if forward_mode.is_decode_or_idle():
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
@@ -351,7 +432,7 @@ class FlashMLABackend(AttentionBackend):
             )
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
             seq_lens = seq_lens + self.draft_token_num
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_metadata(
                 seq_lens.to(torch.int32),
                 self.draft_token_num * self.num_q_heads,
                 1,
@@ -384,7 +465,7 @@ class FlashMLABackend(AttentionBackend):
         seq_lens = seq_lens[:bs]
 
         if forward_mode is not None and forward_mode.is_decode_or_idle():
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_metadata(
                 seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
@@ -399,7 +480,7 @@ class FlashMLABackend(AttentionBackend):
             forward_mode.is_target_verify() or forward_mode.is_draft_extend()
         ):
             seq_lens = seq_lens + self.draft_token_num
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_metadata(
                 seq_lens.to(torch.int32),
                 self.draft_token_num * self.num_q_heads,
                 1,
@@ -466,12 +547,11 @@ class FlashMLABackend(AttentionBackend):
         ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
         reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
 
-        o, _ = flash_mla_with_kvcache(
+        o = self._call_kvcache_fwd(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
             block_table=self.forward_metadata.block_table[:bs],
             cache_seqlens=seq_lens.to(torch.int32) + self.draft_token_num,
-            head_dim_v=self.kv_lora_rank,
             tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
             num_splits=self.forward_metadata.num_splits,
             softmax_scale=layer.scaling,
@@ -544,12 +624,11 @@ class FlashMLABackend(AttentionBackend):
         reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
         cache_lens = seq_lens
 
-        o, _ = flash_mla_with_kvcache(
+        o = self._call_kvcache_fwd(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
             block_table=self.forward_metadata.block_table[:bs],
             cache_seqlens=cache_lens.to(torch.int32),
-            head_dim_v=self.kv_lora_rank,
             tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
             num_splits=self.forward_metadata.num_splits,
             softmax_scale=layer.scaling,
